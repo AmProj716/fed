@@ -1,0 +1,151 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+import copy
+
+# Define the CNN model for MNIST classification
+class CNNModel(nn.Module):
+    def __init__(self):
+        super(CNNModel, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout2d(0.25)
+        self.dropout2 = nn.Dropout2d(0.5)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        output = F.log_softmax(x, dim=1)
+        return output
+
+# Function to partition the dataset into equal parts for each client
+def partition_dataset(dataset, num_clients=10):
+    # Get indices for the whole dataset
+    indices = np.arange(len(dataset))
+    np.random.shuffle(indices)
+    # Equi-distributed indices for each client
+    split_indices = np.array_split(indices, num_clients)
+    client_datasets = [Subset(dataset, idx.tolist()) for idx in split_indices]
+    return client_datasets
+
+# FedProx local update procedure
+def local_training(model, global_model, train_loader, epochs, lr, mu, device):
+    model.train()
+    optimizer = optim.SGD(model.parameters(), lr=lr)
+    criterion = nn.NLLLoss()
+    
+    global_model_params = {name: param.clone().detach() for name, param in global_model.named_parameters()}
+
+    for epoch in range(epochs):
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            # Compute FedProx proximal term: ||w - w_global||^2
+            proximal_term = 0.0
+            for name, param in model.named_parameters():
+                proximal_term += ((param - global_model_params[name]) ** 2).sum()
+            loss += (mu / 2) * proximal_term
+
+            loss.backward()
+            optimizer.step()
+
+    return model.state_dict()
+
+# Function to average model parameters from all clients
+def average_weights(weight_list):
+    avg_weights = copy.deepcopy(weight_list[0])
+    for key in avg_weights.keys():
+        for i in range(1, len(weight_list)):
+            avg_weights[key] += weight_list[i][key]
+        avg_weights[key] = avg_weights[key] / len(weight_list)
+    return avg_weights
+
+def test(model, test_loader, device):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    criterion = nn.NLLLoss(reduction='sum')
+    
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            test_loss += criterion(output, target).item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    test_loss /= len(test_loader.dataset)
+    accuracy = correct / len(test_loader.dataset)
+    return test_loss, accuracy
+
+def main():
+    # Basic configurations
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_clients = 10
+    local_epochs = 5           # Number of local epochs for training on each client
+    global_rounds = 20         # Total number of communication rounds
+    batch_size = 64
+    learning_rate = 0.01
+    mu = 0.1                 # FedProx hyperparameter for proximal term
+
+    # MNIST dataset loading and transformation
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    
+    train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST('./data', train=False, transform=transform)
+    
+    # Create data loaders for each client
+    client_datasets = partition_dataset(train_dataset, num_clients=num_clients)
+    client_loaders = [DataLoader(dataset, batch_size=batch_size, shuffle=True) for dataset in client_datasets]
+    
+    # Test loader for global evaluation
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Initialize the global model
+    global_model = CNNModel().to(device)
+    global_model.train()
+    
+    # Federated training process
+    for round in range(global_rounds):
+        print(f"\nCommunication Round {round + 1}/{global_rounds}")
+        local_weights = []
+        # For each client perform local training with FedProx
+        for client in range(num_clients):
+            local_model = copy.deepcopy(global_model)
+            local_model.to(device)
+            print(f"  Training on client {client + 1}")
+            updated_weights = local_training(local_model, global_model, client_loaders[client],
+                                             epochs=local_epochs, lr=learning_rate, mu=mu, device=device)
+            local_weights.append(updated_weights)
+        
+        # Aggregate updates (simple average)
+        global_weights = average_weights(local_weights)
+        global_model.load_state_dict(global_weights)
+        
+        # Evaluate global model after each round
+        test_loss, test_accuracy = test(global_model, test_loader, device)
+        print(f"  Global Model Test Loss: {test_loss:.4f}, Accuracy: {test_accuracy * 100:.2f}%")
+    
+    print("Federated training with FedProx completed.")
+
+if __name__ == '__main__':
+    main()
